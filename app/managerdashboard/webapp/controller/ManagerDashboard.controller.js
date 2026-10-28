@@ -1,0 +1,764 @@
+sap.ui.define([
+    "sap/ui/core/mvc/Controller",
+    "sap/ui/model/json/JSONModel",
+    "sap/ui/core/Fragment",
+    "sap/ui/core/format/DateFormat",
+    "sap/base/i18n/Localization",
+    "sap/m/MessageToast",
+    "sap/m/library",
+    "managerdashboard/util/PdfReport"
+], function (Controller, JSONModel, Fragment, DateFormat, Localization, MessageToast, mobileLibrary, PdfReport) {
+    "use strict";
+
+    var DAY = 24 * 60 * 60 * 1000;
+    var STATUSES = ["In Stock", "Assigned", "Maintenance", "Retired", "Archived"];
+
+    // Managers only open the apps they may see; same intents as the launchpad tiles (<SemanticObject>-manage).
+    // Outside a launchpad the app is opened directly.
+    var APP_URLS = {
+        Assets: "../assets/index.html",
+        Maintenance: "../maintenance/index.html"
+    };
+
+    function iso(d) {
+        if (!d) { return ""; }
+        var m = d.getMonth() + 1, day = d.getDate();
+        return d.getFullYear() + "-" + (m < 10 ? "0" + m : m) + "-" + (day < 10 ? "0" + day : day);
+    }
+
+    function isOpen(r) {
+        return r.status === "Open" || r.status === "In Progress";
+    }
+
+    return Controller.extend("managerdashboard.controller.ManagerDashboard", {
+        
+
+        onInit: function () {
+            var that = this;
+            this._assets = [];
+            this._ledger = [];
+            this._maintenance = [];
+            this._posted = [];
+            this._savedNotifications = [];
+            this._rows = [];
+            this._dateFmt = DateFormat.getDateInstance({ style: "medium" });
+            this._dateTimeFmt = DateFormat.getDateTimeInstance({ style: "medium" });
+
+            this.getView().setModel(new JSONModel({
+                busy: false, error: "", updated: "",
+                language: Localization.getLanguage().slice(0, 2).toLowerCase() === "de" ? "de" : "en",
+                filters: { status: "", category: "", location: "", department: "", from: null, to: null },
+                options: { statuses: [], categories: [], locations: [], departments: [] },
+                kpi: {}, kpiText: {},
+                statusSegments: [], segmentCount: 1,
+                departmentBars: [], deptBarCount: 1,
+                maintTypeBars: [], maintBarCount: 1,
+                assignments: [], history: [], maintenance: [], summary: [],
+                notifications: [], notifCount: "0",
+                 assetDetail: {},
+                 kpiAssets: [],
+                kpiTitle: "",
+
+                requests: [],
+                reqOptions: { employees: [], assets: [] },
+                reqForm: { employeeId: "", assetId: "", justification: "", neededBy: null, error: "", busy: false, emp: {}, asset: {} }
+            }), "dash");
+
+            // getResourceBundle() returns a Promise when the i18n model is loaded async
+            Promise.resolve(this.getOwnerComponent().getModel("i18n").getResourceBundle()).then(function (bundle) {
+                that._bundle = bundle;
+                that._load();
+            });
+        },
+
+        _t: function (key, args) {
+            return this._bundle.getText(key, args);
+        },
+
+        // Translate a backend code value (status, action, type, ...) when a text exists, else show it as is.
+        _tr: function (prefix, value) {
+            var key = prefix + "_" + String(value || "").replace(/\s/g, "");
+            return value && this._bundle.hasText(key) ? this._t(key) : (value || "");
+        },
+
+        _date: function (s) {
+            return s ? this._dateFmt.format(new Date(s + (s.length === 10 ? "T00:00:00" : ""))) : "";
+        },
+
+        _serviceUrl: function () {
+            var uri = this.getOwnerComponent().getManifestEntry("/sap.app/dataSources/mainService/uri") || "/odata/v4/catalog/";
+            return uri.slice(-1) === "/" ? uri : uri + "/";
+        },
+
+        _get: function (path) {
+            return fetch(this._serviceUrl() + path, {
+                headers: { Accept: "application/json", "Accept-Language": Localization.getLanguage() },
+                credentials: "same-origin"
+            }).then(function (r) {
+                if (!r.ok) {
+                    return r.text().then(function (t) {
+                        var msg = t;
+                        try { msg = JSON.parse(t).error.message; } catch (e) { /* keep raw text */ }
+                        throw new Error(r.status + " on " + path.split("?")[0] + ": " + msg);
+                    });
+                }
+                return r.json();
+            }).then(function (j) { return j.value || []; });
+        },
+
+        _load: function () {
+            var that = this, model = this.getView().getModel("dash");
+            model.setProperty("/busy", true);
+            model.setProperty("/error", "");
+
+            var soft = function (p) { return p.catch(function () { return []; }); };
+
+            // Read-only dashboard views: managers have no access to the master data entities.
+            Promise.all([
+                this._get("AssetOverviewSrv?$select=asset_ID,assetTag,model,serialNumber,status,purchaseDate,warrantyExpiry,firstDistributionDate," +
+                    "categoryName,holderId,holderName,holderLocation,holderDepartment&$top=5000"),
+                soft(this._get("AssetHistorySrv?$select=ledger_ID,assetId,action,transitionDate,fromName,toId,toName,notes,createdAt" +
+                    "&$orderby=transitionDate desc,createdAt desc&$top=5000")),
+                soft(this._get("MaintenanceOverviewSrv?$select=maintenance_ID,assetId,type,vendorName,reportedDate,completedDate,status&$orderby=reportedDate desc&$top=5000")),
+                 soft(this._get("AssetRequestOverviewSrv?$select=request_ID,requestNo,status,neededBy,createdAt,rejectionReason,employeeName,assetTag,assetModel&$orderby=createdAt desc&$top=200")),
+                 soft(this._get("NotificationSrv?$select=notification_ID,title,message,isRead,createdAt&$orderby=createdAt desc&$top=100"))
+            ]).then(function (res) {
+                var none = that._t("unassigned");
+                that._assets = res[0].map(function (a) {
+                    a._category   = a.categoryName || that._t("noCategory");
+                    a._holder     = a.holderName || none;
+                    a._location   = (a.holderId && a.holderLocation) || none;
+                    a._department = (a.holderId && a.holderDepartment) || none;
+                    return a;
+                });
+                that._ledger = res[1];
+                that._maintenance = res[2];
+                that._buildRequests(res[3]);
+                that._savedNotifications = (res[4] || []).map(function (n) {
+                    return {
+                        title: n.title || "Notification",
+                        desc: n.message || "",
+                        icon: "sap-icon://bell",
+                        state: n.isRead ? "None" : "Information",
+                        time: n.createdAt ? that._dateTimeFmt.format(new Date(n.createdAt)) : ""
+                    };
+                });
+
+                that._buildOptions();
+                that._refresh();
+                model.setProperty("/updated", new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+            }).catch(function (e) {
+                model.setProperty("/error", that._t("loadError", [e.message]));
+            }).finally(function () {
+                model.setProperty("/busy", false);
+            });
+        },
+
+        _distinct: function (key, allText) {
+            var seen = {}, list = [];
+            this._assets.forEach(function (a) {
+                var v = a[key];
+                if (v && !seen[v]) { seen[v] = true; list.push({ key: v, text: v }); }
+            });
+            list.sort(function (x, y) { return x.text.localeCompare(y.text); });
+            list.unshift({ key: "", text: allText });
+            return list;
+        },
+
+        _buildOptions: function () {
+            var that = this, m = this.getView().getModel("dash");
+            var statuses = STATUSES.map(function (s) { return { key: s, text: that._tr("status", s) }; });
+            statuses.unshift({ key: "", text: this._t("allStatuses") });
+            m.setProperty("/options/statuses",    statuses);
+            m.setProperty("/options/categories",  this._distinct("_category",   this._t("allCategories")));
+            m.setProperty("/options/locations",   this._distinct("_location",   this._t("allLocations")));
+            m.setProperty("/options/departments", this._distinct("_department", this._t("allDepartments")));
+        },
+
+        _filteredRows: function () {
+            var f = this.getView().getModel("dash").getProperty("/filters");
+            var from = iso(f.from), to = iso(f.to);
+            return this._assets.filter(function (a) {
+                if (f.status     && a.status !== f.status)          { return false; }
+                if (f.category   && a._category !== f.category)     { return false; }
+                if (f.location   && a._location !== f.location)     { return false; }
+                if (f.department && a._department !== f.department) { return false; }
+                if (from && (!a.purchaseDate || a.purchaseDate < from)) { return false; }
+                if (to   && (!a.purchaseDate || a.purchaseDate > to))   { return false; }
+                return true;
+            });
+        },
+
+        _donutHtml: function (segs) {
+               // Purple
+              var hexOf = {
+    "Assigned": "#0F766E",
+    "In Stock": "#14B8A6",
+    "Maintenance": "#2DD4BF",
+    "Retired": "#0D9488",
+    "Archived": "#99F6E4"
+};
+            var esc = function (t) { return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); };
+            var total = segs.reduce(function (t, s) { return t + s.value; }, 0);
+            var wrap = "display:flex;flex-wrap:wrap;align-items:center;gap:1.5rem;padding:0.5rem 0.25rem;";
+            if (!total) { return '<div style="' + wrap + 'color:var(--sapContent_LabelColor);">-</div>'; }
+            var R = 40, C = 2 * Math.PI * R, offset = 0, rings = "", legend = "";
+            segs.forEach(function (s) {
+                var len = s.value / total * C, color = hexOf[s.key] || "#758ca4";
+                rings += '<circle cx="60" cy="60" r="' + R + '" fill="none" stroke="' + color + '" stroke-width="22"' +
+                    ' stroke-dasharray="' + len.toFixed(3) + ' ' + (C - len).toFixed(3) + '"' +
+                    ' stroke-dashoffset="' + (-offset).toFixed(3) + '" transform="rotate(-90 60 60)">' +
+                    '<title>' + esc(s.label) + ': ' + s.value + '</title></circle>';
+                offset += len;
+                legend += '<div style="display:flex;align-items:center;gap:0.5rem;margin:0.25rem 0;">' +
+                    '<span style="width:0.75rem;height:0.75rem;border-radius:50%;flex:none;background:' + color + ';"></span>' +
+                    '<span style="color:var(--sapTextColor);">' + esc(s.label) + '</span>' +
+                    '<b style="margin-left:auto;padding-left:1rem;color:var(--sapTextColor);">' + s.value + '</b></div>';
+            });
+            return '<div style="' + wrap + '">' +
+                '<svg width="160" height="160" viewBox="0 0 120 120" role="img" aria-label="' + esc(this._t("chartStatus")) + '">' + rings +
+                '<text x="60" y="62" text-anchor="middle" font-size="22" font-weight="700" fill="var(--sapTextColor)">' + total + '</text>' +
+                '<text x="60" y="76" text-anchor="middle" font-size="8" fill="var(--sapContent_LabelColor)">' + esc(this._t("kpiTotal")) + '</text></svg>' +
+                '<div style="flex:1;min-width:11rem;">' + legend + '</div></div>';
+        },
+        _barsHtml: function (bars) {
+            var esc = function (t) { return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); };
+            if (!bars || !bars.length) {
+                return '<div style="color:var(--sapContent_LabelColor);padding:0.5rem;">-</div>';
+            }
+            var max = bars.reduce(function (m, b) { return Math.max(m, b.value); }, 1);
+            var rows = bars.map(function (b) {
+                var w = Math.max(b.value / max * 100, 8).toFixed(1);
+                return '<div style="display:flex;align-items:center;gap:0.75rem;margin:0.45rem 0;">' +
+                    '<div style="width:8rem;flex:none;color:var(--sapContent_LabelColor);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(b.label) + '">' + esc(b.label) + '</div>' +
+                    '<div style="flex:1;border-left:1px solid var(--sapContent_ForegroundBorderColor);">' +
+                    '<div style="width:' + w + '%;background:#0F766E;color:#fff;font-weight:700;text-align:right;padding:0.4rem 0.5rem;border-radius:0 4px 4px 0;box-sizing:border-box;">' + esc(b.display) + '</div></div></div>';
+            }).join("");
+            return '<div style="padding:0.25rem;">' + rows + '</div>';
+        },
+
+       _bars: function (items, keyFn) {
+    var by = {};
+
+    items.forEach(function (x) {
+        var k = keyFn(x);
+        by[k] = (by[k] || 0) + 1;
+    });
+
+    var colors = [
+        "Good",
+        "Critical",
+        "Neutral",
+        "Error",
+        "Good",
+        "Critical"
+    ];
+
+    return Object.keys(by)
+        .map(function (k, index) {
+            return {
+                label: k,
+                value: by[k],
+                display: String(by[k]),
+                color: colors[index % colors.length]
+            };
+        })
+        .sort(function (x, y) {
+            return y.value - x.value;
+        })
+        .slice(0, 6);
+},
+
+        _refresh: function () {
+            var that = this, m = this.getView().getModel("dash");
+            var rows = this._rows = this._filteredRows();
+            var none = this._t("unassigned");
+
+            var count = function (s) { return rows.filter(function (a) { return a.status === s; }).length; };
+            var total = rows.length, available = count("In Stock"), assigned = count("Assigned"),
+                maint = count("Maintenance"), retired = count("Retired"), archived = count("Archived");
+            var pct = function (n) { return total ? Math.round(n * 100 / total) : 0; };
+
+            var locs = {};
+            rows.forEach(function (a) { if (a._location !== none) { locs[a._location] = true; } });
+            var locCount = Object.keys(locs).length;
+
+            var byId = {};
+            rows.forEach(function (a) { byId[a.asset_ID] = a; });
+
+            // Maintenance of the filtered assets: open records first, then the most recent
+            var now = Date.now(), cutoff = now - 7 * DAY;
+            var maintRows = this._maintenance.filter(function (r) { return byId[r.assetId]; });
+            var open = maintRows.filter(isOpen);
+            var overdue = open.filter(function (r) {
+                return r.reportedDate && new Date(r.reportedDate).getTime() < cutoff;
+            }).length;
+
+            // Ownership ledger of the filtered assets (already sorted newest first)
+            var ledger = this._ledger.filter(function (l) { return byId[l.assetId]; });
+            var since30 = iso(new Date(now - 30 * DAY));
+            var recent = ledger.filter(function (l) { return l.transitionDate && l.transitionDate >= since30; });
+            var assignments30 = recent.filter(function (l) { return l.action === "Assign" || l.action === "Reassign"; }).length;
+            var returns30 = recent.filter(function (l) { return l.action === "Return"; }).length;
+
+            var kpi = { total: total, assigned: assigned, available: available, maintenance: maint,
+                        openMaint: open.length, assignments30: assignments30 };
+            var kpiText = {
+                total:         this._t("ctxLocations",   [locCount]),
+                assigned:      this._t("ctxUtilization", [pct(assigned)]),
+                available:     this._t("ctxInventory",   [pct(available)]),
+                maintenance:   this._t("ctxAttention",   [overdue]),
+                openMaint:     this._t("ctxOverdue",     [overdue]),
+                assignments30: this._t("ctxReturns",     [returns30])
+            };
+            m.setProperty("/kpi", kpi);
+            m.setProperty("/kpiText", kpiText);
+
+           var segs = [
+    { s: "Assigned",    value: assigned,  color: "Good" },
+    { s: "In Stock",    value: available, color: "Neutral" },
+    { s: "Maintenance", value: maint,     color: "Critical" },
+    { s: "Retired",     value: retired,   color: "Error" },
+    { s: "Archived",    value: archived,  color: "Neutral" }
+].map(function (item) {
+    var percentage = total
+        ? Math.round(item.value * 100 / total)
+        : 0;
+
+    return {
+        label: that._tr("status", item.s) + " (" + percentage + "%)",
+        value: Number(item.value),
+        display: String(item.value),
+        color: item.color,
+        key: item.s
+    };
+});
+
+m.setProperty("/statusSegments", segs);
+m.setProperty("/segmentCount", segs.length);
+m.setProperty("/donutHtml", this._donutHtml(segs.filter(function (x) { return x.value > 0; })));
+
+            var deptBars = this._bars(rows.filter(function (a) { return a.status === "Assigned" && a._department !== none; }),
+                function (a) { return a._department; });
+            m.setProperty("/departmentBars", deptBars);
+            m.setProperty("/departmentBarsHtml", this._barsHtml(deptBars));
+            m.setProperty("/deptBarCount", Math.max(deptBars.length, 1));
+
+            var typeBars = this._bars(maintRows, function (r) { return r.type ? that._tr("mtype", r.type) : that._t("noType"); });
+            m.setProperty("/maintTypeBars", typeBars);
+            m.setProperty("/maintTypeBarsHtml", this._barsHtml(typeBars));
+            m.setProperty("/maintBarCount", Math.max(typeBars.length, 1));
+
+            // Current assignments, with the date of the latest assignment to the current holder
+            m.setProperty("/assignments", rows.filter(function (a) { return a.status === "Assigned"; }).map(function (a) {
+                var last = ledger.filter(function (l) {
+                    return l.assetId === a.asset_ID && l.toId === a.holderId;
+                })[0];
+                return { assetTag: a.assetTag, model: a.model, holder: a._holder, department: a._department,
+                    location: a._location, since: that._date((last && last.transitionDate) || a.firstDistributionDate) };
+            }).sort(function (x, y) { return String(x.assetTag).localeCompare(String(y.assetTag)); }));
+
+            m.setProperty("/history", ledger.map(function (l) {
+                return { date: that._date(l.transitionDate), assetTag: byId[l.assetId].assetTag,
+                    action: that._tr("action", l.action), from: l.fromName || "-",
+                    to: l.toName || "-", notes: l.notes || "" };
+            }));
+
+            m.setProperty("/maintenance", open.concat(maintRows.filter(function (r) { return !isOpen(r); })).map(function (r) {
+                var days = isOpen(r) && r.reportedDate ? Math.max(Math.floor((now - new Date(r.reportedDate).getTime()) / DAY), 0) : "";
+                return { assetTag: byId[r.assetId].assetTag, type: that._tr("mtype", r.type),
+                    statusText: that._tr("mstatus", r.status),
+                    state: isOpen(r) ? (days !== "" && days > 7 ? "Error" : "Warning") : "Success",
+                    vendor: r.vendorName || "", reported: that._date(r.reportedDate),
+                    daysOpen: String(days), completed: that._date(r.completedDate) };
+            }));
+
+            m.setProperty("/summary", [
+                { metric: this._t("kpiTotal"),         value: String(total),         context: kpiText.total },
+                { metric: this._t("kpiAssigned"),      value: String(assigned),      context: kpiText.assigned },
+                { metric: this._t("kpiAvailable"),     value: String(available),     context: kpiText.available },
+                { metric: this._t("kpiMaintenance"),   value: String(maint),         context: kpiText.maintenance },
+                { metric: this._t("kpiOpenMaint"),     value: String(open.length),   context: kpiText.openMaint },
+                { metric: this._t("kpiAssignments30"), value: String(assignments30), context: kpiText.assignments30 }
+            ]);
+
+            this._buildNotifications(rows, overdue);
+        },
+
+        _buildNotifications: function (rows, overdue) {
+            var today = iso(new Date()), soon = iso(new Date(Date.now() + 30 * DAY));
+            var expiring = rows.filter(function (a) {
+                return a.warrantyExpiry && a.warrantyExpiry >= today && a.warrantyExpiry <= soon &&
+                    (a.status === "In Stock" || a.status === "Assigned" || a.status === "Maintenance");
+            }).length;
+
+            var list = (this._savedNotifications || []).concat(this._posted.slice());
+            if (overdue)  { list.push({ title: this._t("notifMaint", [overdue]),     desc: this._t("notifMaintDesc"),    icon: "sap-icon://wrench", state: "Warning", time: "" }); }
+            if (expiring) { list.push({ title: this._t("notifWarranty", [expiring]), desc: this._t("notifWarrantyDesc"), icon: "sap-icon://shield", state: "Warning", time: "" }); }
+
+            var m = this.getView().getModel("dash");
+            m.setProperty("/notifications", list);
+            m.setProperty("/notifCount", String(list.length));
+        },
+
+        _filterSummary: function () {
+            var f = this.getView().getModel("dash").getProperty("/filters"), parts = [];
+            if (f.from || f.to) { parts.push(this._t("filterDate") + ": " + (f.from ? this._dateFmt.format(f.from) : "...") + " - " + (f.to ? this._dateFmt.format(f.to) : "...")); }
+            if (f.status)     { parts.push(this._t("filterStatus") + ": " + this._tr("status", f.status)); }
+            if (f.category)   { parts.push(this._t("filterCategory") + ": " + f.category); }
+            if (f.location)   { parts.push(this._t("filterLocation") + ": " + f.location); }
+            if (f.department) { parts.push(this._t("filterDepartment") + ": " + f.department); }
+            return parts.length ? parts.join("; ") : this._t("noFilters");
+        },
+
+        // Navigate like the launchpad tiles do: intent <SemanticObject>-manage inside the launchpad,
+        // otherwise open the target app directly.
+        _navigate: function (semanticObject, params) {
+            var u = window.sap && sap.ushell;
+            if (u && u.Container && u.Container.getServiceAsync) {
+                var target = { target: { semanticObject: semanticObject, action: "manage" }, params: params || {} };
+                u.Container.getServiceAsync("Navigation").then(function (nav) {
+                    return nav.navigate(target);
+                }).catch(function () {
+                    return u.Container.getServiceAsync("CrossApplicationNavigation").then(function (nav) {
+                        nav.toExternal(target);
+                    });
+                });
+            } else if (APP_URLS[semanticObject]) {
+                mobileLibrary.URLHelper.redirect(APP_URLS[semanticObject], false);
+            }
+        },
+
+        onFilterChange: function () { this._refresh(); },
+
+        onClear: function () {
+            this.getView().getModel("dash").setProperty("/filters",
+                { status: "", category: "", location: "", department: "", from: null, to: null });
+            this._refresh();
+        },
+
+        onRefresh: function () { this._load(); },
+
+        onLanguageChange: function (oEvent) {
+            var url = new URL(window.location.href);
+            url.searchParams.set("sap-language", oEvent.getSource().getSelectedKey());
+            window.location.href = url.toString();
+        },
+
+       onKpiPress: function (status) {
+    var that = this;
+    var filtered = status
+        ? this._assets.filter(function (a) { return a.status === status; })
+        : this._assets;
+
+    this.getView().getModel("dash").setProperty("/kpiAssets", filtered.map(function (a) {
+        var stateOf = { "In Stock": "Success", "Assigned": "Information", "Maintenance": "Warning", "Retired": "Error", "Archived": "None" };
+        return {
+            assetTag: a.assetTag, model: a.model, serialNumber: a.serialNumber,
+            status: a.status, statusState: stateOf[a.status] || "None",
+            category: a._category, holder: a._holder,
+            department: a._department, location: a._location,
+            purchaseDate: that._date(a.purchaseDate)
+        };
+    }));
+
+    this.getView().getModel("dash").setProperty("/kpiTitle",
+        (status ? status : "All Assets") + " (" + filtered.length + ")");
+
+    if (!this._kpiDialog) {
+        this._kpiDialog = Fragment.load({
+            id: this.getView().getId(),
+            name: "managerdashboard.view.AssetList",
+            controller: this
+        }).then(function (d) {
+            that.getView().addDependent(d);
+            return d;
+        }).catch(function (e) {
+            that._kpiDialog = null;
+            sap.m.MessageBox.error("Error: " + (e && e.message ? e.message : e));
+            throw e;
+        });
+    }
+    this._kpiDialog.then(function (d) { d.open(); });
+},
+
+onCloseKpiDialog: function () {
+    this._kpiDialog.then(function (d) { d.close(); });
+},
+
+onKpiAssetPress: function (oEvent) {
+    var row = oEvent.getSource().getBindingContext("dash").getObject();
+    this._kpiDialog.then(function (d) { d.close(); });
+    var that = this;
+    setTimeout(function () { that.onAssetRowPress({ getSource: function () { return { getBindingContext: function () { return { getObject: function () { return row; } }; } }; } }); }, 300);
+},
+
+onAssetRowPress: function (oEvent) {
+    var that = this;
+    var row = oEvent.getSource().getBindingContext("dash").getObject();
+    var stateOf = { "In Stock": "Success", "Assigned": "Information", "Maintenance": "Warning", "Retired": "Error", "Archived": "None" };
+
+    // find full asset details from the already-loaded assets array
+    var asset = (this._assets || []).filter(function (a) {
+        return a.assetTag === row.assetTag;
+    })[0] || {};
+
+    this.getView().getModel("dash").setProperty("/assetDetail", {
+        assetTag:        asset.assetTag        || row.assetTag   || "",
+        model:           asset.model           || row.model      || "",
+        serialNumber:    asset.serialNumber    || "",
+        status:          asset.status          || "",
+        statusState:     stateOf[asset.status] || "None",
+        category:        asset._category       || "",
+        vendor:          asset.vendorName      || "",
+        holder:          asset._holder         || "",
+        department:      asset._department     || "",
+        location:        asset._location       || "",
+        purchaseDate:    this._date(asset.purchaseDate),
+        warrantyExpiry:  this._date(asset.warrantyExpiry),
+        firstDistribution: this._date(asset.firstDistributionDate)
+    });
+
+    if (!this._assetDetailDialog) {
+        this._assetDetailDialog = Fragment.load({
+            id: this.getView().getId(),
+            name: "managerdashboard.view.AssetDetail",
+            controller: this
+        }).then(function (d) {
+            that.getView().addDependent(d);
+            return d;
+        }).catch(function (e) {
+            that._assetDetailDialog = null;
+            sap.m.MessageBox.error("Could not open asset detail: " + (e && e.message ? e.message : e));
+            throw e;
+        });
+    }
+    this._assetDetailDialog.then(function (d) { d.open(); });
+},
+
+onCloseAssetDetail: function () {
+    this._assetDetailDialog.then(function (d) { d.close(); });
+},
+
+
+
+
+
+        onMaintenancePress: function () {
+            this._navigate("Maintenance", {});
+        },
+
+        onOpenNotifications: function (oEvent) {
+            var that = this, source = oEvent.getSource();
+            if (!this._notifPopover) {
+                this._notifPopover = Fragment.load({
+                    id: this.getView().getId(),
+                    name: "managerdashboard.view.Notifications",
+                    controller: this
+                }).then(function (pop) {
+                    that.getView().addDependent(pop);
+                    return pop;
+                });
+            }
+            this._notifPopover.then(function (pop) { pop.openBy(source); });
+        },
+                // ================= REQUEST ASSET =================
+
+        _post: function (path, body) {
+            var url = this._serviceUrl();
+            return fetch(url, { method: "HEAD", headers: { "X-CSRF-Token": "Fetch" }, credentials: "same-origin" })
+                .then(function (r) { return r.headers.get("X-CSRF-Token") || ""; })
+                .catch(function () { return ""; })
+                .then(function (token) {
+                    var h = { "Content-Type": "application/json", Accept: "application/json" };
+                    if (token) { h["X-CSRF-Token"] = token; }
+                    return fetch(url + path, { method: "POST", headers: h, credentials: "same-origin", body: JSON.stringify(body) });
+                })
+                .then(function (r) {
+                    if (!r.ok) {
+                        return r.text().then(function (t) {
+                            var msg = t;
+                            try { msg = JSON.parse(t).error.message; } catch (e) { /* keep raw text */ }
+                            throw new Error(msg);
+                        });
+                    }
+                    return r.json();
+                });
+        },
+
+        _buildRequests: function (list) {
+            var that = this;
+            var stateOf = { Pending: "Warning", Approved: "Success", Rejected: "Error" };
+            this.getView().getModel("dash").setProperty("/requests", (list || []).map(function (r) {
+                return {
+                    requestNo: r.requestNo,
+                    employee: r.employeeName || "",
+                    asset: (r.assetTag || "") + (r.assetModel ? " - " + r.assetModel : ""),
+                    neededBy: that._date(r.neededBy),
+                    created: that._date(r.createdAt),
+                    status: r.status,
+                    state: stateOf[r.status] || "None",
+                    reason: r.rejectionReason || ""
+                };
+            }));
+        },
+
+        onRequestAsset: function () {
+            var that = this, m = this.getView().getModel("dash");
+            m.setProperty("/reqForm", { employeeId: "", assetId: "", justification: "", neededBy: null, error: "", busy: false, emp: {}, asset: {} });
+            m.setProperty("/reqOptions/employees", []);
+
+            this._availableAssets = this._assets.filter(function (a) { return a.status === "In Stock"; });
+            m.setProperty("/reqOptions/assets", this._availableAssets.map(function (a) {
+                return { key: a.asset_ID, text: a.assetTag + " - " + a.model };
+            }));
+
+            this._get("EmployeeLookupSrv?$select=employee_ID,fullName,email,phone,location,status,departmentName&$orderby=fullName&$top=1000")
+                .then(function (list) {
+                    that._employees = list.filter(function (e) { return String(e.status).toLowerCase() === "active"; });
+                    m.setProperty("/reqOptions/employees", that._employees.map(function (e) {
+                        return { key: e.employee_ID, text: e.fullName };
+                    }));
+                }).catch(function (e) {
+                    m.setProperty("/reqForm/error", that._t("reqFailed", [e.message]));
+                });
+
+                       if (!this._reqDialog) {
+                this._reqDialog = Fragment.load({
+                    id: this.getView().getId(),
+                    name: "managerdashboard.view.RequestAsset",
+                    controller: this
+                }).then(function (d) {
+                    that.getView().addDependent(d);
+                    return d;
+                }).catch(function (e) {
+                    that._reqDialog = null;
+                    sap.m.MessageBox.error("Could not open the request dialog:\n" + (e && e.message ? e.message : e));
+                    throw e;
+                });
+            }
+            this._reqDialog.then(function (d) { d.open(); }).catch(function () { /* already shown */ });
+        },
+
+        onRequestEmployeeChange: function (oEvent) {
+            var id = oEvent.getSource().getSelectedKey();
+            var e = (this._employees || []).filter(function (x) { return x.employee_ID === id; })[0] || {};
+            this.getView().getModel("dash").setProperty("/reqForm/emp", {
+                name: e.fullName || "", email: e.email || "", phone: e.phone || "",
+                department: e.departmentName || "", location: e.location || ""
+            });
+        },
+
+        onRequestAssetChange: function (oEvent) {
+            var id = oEvent.getSource().getSelectedKey();
+            var a = (this._availableAssets || []).filter(function (x) { return x.asset_ID === id; })[0] || {};
+            this.getView().getModel("dash").setProperty("/reqForm/asset", {
+                category: a._category || "", serial: a.serialNumber || ""
+            });
+        },
+
+        onSubmitRequest: function () {
+            var that = this, m = this.getView().getModel("dash"), f = m.getProperty("/reqForm");
+            m.setProperty("/reqForm/error", "");
+            if (!f.employeeId || !f.assetId) {
+                m.setProperty("/reqForm/error", this._t("reqSelectBoth"));
+                return;
+            }
+            var body = {
+                employee_employee_ID: f.employeeId,
+                asset_asset_ID: f.assetId,
+                justification: f.justification || null
+            };
+            if (f.neededBy) { body.neededBy = iso(f.neededBy); }
+
+            m.setProperty("/reqForm/busy", true);
+            this._post("AssetRequestSrv", body).then(function (created) {
+                MessageToast.show(that._t("reqSent", [created.requestNo || ""]));
+                that._reqDialog.then(function (d) { d.close(); });
+                that._load();
+            }).catch(function (e) {
+                m.setProperty("/reqForm/error", that._t("reqFailed", [e.message]));
+            }).finally(function () {
+                m.setProperty("/reqForm/busy", false);
+            });
+        },
+
+        onCancelRequest: function () {
+            this._reqDialog.then(function (d) { d.close(); });
+        },
+
+        // FR-023 (revised): share the current report as an in-app notification instead of email.
+        // Session-only for now; nothing is persisted on the backend.
+        onNotify: function () {
+            this._posted.unshift({
+                title: this._t("notifReportTitle"),
+                desc: this._t("notifReportDesc", [this._rows.length, this._filterSummary()]),
+                icon: "sap-icon://pdf-attachment",
+                state: "Success",
+                time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+            });
+            this._refresh();
+            MessageToast.show(this._t("notifyDone"));
+        },
+
+        onDownloadPdf: function () {
+            var that = this, m = this.getView().getModel("dash");
+            var now = new Date();
+            var pdf = new PdfReport();
+
+            pdf.text(this._t("pdfTitle"), { size: 16, bold: true })
+               .text(this._t("pdfGenerated", [this._dateTimeFmt.format(now)]))
+               .text(this._t("pdfRole"))
+               .text(this._t("pdfFilters", [this._filterSummary()]))
+               .line().space(4);
+
+            pdf.text(this._t("summaryTitle"), { size: 12, bold: true })
+               .table([{ header: this._t("colMetric"), width: 0.35 }, { header: this._t("colValue"), width: 0.2 }, { header: this._t("colContext"), width: 0.45 }],
+                   m.getProperty("/summary").map(function (r) { return [r.metric, r.value, r.context]; }))
+               .space(10);
+
+            pdf.text(this._t("assignmentsTitle") + " (" + m.getProperty("/assignments").length + ")", { size: 12, bold: true })
+               .table([
+                   { header: this._t("colAsset"),      width: 0.15 },
+                   { header: this._t("colModel"),      width: 0.22 },
+                   { header: this._t("colHolder"),     width: 0.2 },
+                   { header: this._t("colDepartment"), width: 0.17 },
+                   { header: this._t("colLocation"),   width: 0.12 },
+                   { header: this._t("colSince"),      width: 0.14 }
+               ], m.getProperty("/assignments").map(function (a) {
+                   return [a.assetTag, a.model, a.holder, a.department, a.location, a.since];
+               }))
+               .space(10);
+
+            pdf.text(this._t("maintenanceTitle") + " (" + m.getProperty("/maintenance").length + ")", { size: 12, bold: true })
+               .table([
+                   { header: this._t("colAsset"),     width: 0.15 },
+                   { header: this._t("colType"),      width: 0.16 },
+                   { header: this._t("colStatus"),    width: 0.15 },
+                   { header: this._t("colVendor"),    width: 0.2 },
+                   { header: this._t("colReported"),  width: 0.14 },
+                   { header: this._t("colDaysOpen"),  width: 0.08 },
+                   { header: this._t("colCompleted"), width: 0.12 }
+               ], m.getProperty("/maintenance").map(function (r) {
+                   return [r.assetTag, r.type, r.statusText, r.vendor, r.reported, r.daysOpen, r.completed];
+               }))
+               .space(10);
+
+            pdf.text(this._t("pdfAssetList", [this._rows.length]), { size: 12, bold: true })
+               .table([
+                   { header: this._t("colAsset"),         width: 0.14 },
+                   { header: this._t("colModel"),         width: 0.22 },
+                   { header: this._t("colSerial"),        width: 0.14 },
+                   { header: this._t("filterCategory"),   width: 0.13 },
+                   { header: this._t("filterStatus"),     width: 0.12 },
+                   { header: this._t("filterDepartment"), width: 0.13 },
+                   { header: this._t("filterLocation"),   width: 0.12 }
+               ], this._rows.map(function (a) {
+                   return [a.assetTag, a.model, a.serialNumber, a._category, that._tr("status", a.status), a._department, a._location];
+               }));
+
+            pdf.download("asset-report-" + iso(now) + ".pdf", this._t("pdfTitle") + " - " + this._dateTimeFmt.format(now));
+            MessageToast.show(this._t("pdfDone"));
+        }
+    });
+});

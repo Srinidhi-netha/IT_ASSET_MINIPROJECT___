@@ -1,0 +1,36 @@
+{
+  "requires": {
+    "[development]": {
+      "auth": {
+        "kind": "mocked",
+        "users": {
+          "srinidhipaladugu24@gmail.com": { "password": "1", "roles": ["Admin"] },
+          "bob@company.com":              { "password": "1", "roles": ["Manager"] },
+          "alice@company.com":            { "password": "1", "roles": ["User"] },
+          "alice": false,
+          "bob": false,
+          "carol": false,
+          "dave": false,
+          "erin": false,
+          "fred": false,
+          "me": false,
+          "yves": false,
+          "*": false
+        }
+      }
+    },
+    "[hybrid]": {
+      "auth": {
+        "kind": "mocked",
+        "users": {
+          "srinidhipaladugu24@gmail.com": { "password": "1", "roles": ["Admin"] },
+          "bob@company.com":              { "password": "1", "roles": ["Manager"] },
+          "alice@company.com":            { "password": "1", "roles": ["User"] }
+        }
+      }
+    },
+    "[production]": {
+      "auth": "xsuaa"
+    }
+  }
+}

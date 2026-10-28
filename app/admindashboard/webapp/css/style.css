@@ -1,0 +1,127 @@
+/* Dashboard Eyebrow */
+.dashEyebrow {
+    font-size: 0.75rem;
+    font-weight: bold;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--sapContent_LabelColor);
+}
+
+/* Hero Banner */
+.adminHero {
+    background: linear-gradient(
+        90deg,
+        #082544 0%,
+        #0f6b45 50%,
+        #2c93d6 100%
+    );
+    border-radius: 16px;
+    padding: 2rem;
+    margin-bottom: 1rem;
+    color: #ffffff;
+}
+
+.adminAvatar {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.heroLabel {
+    color: #ffffff;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+
+.heroTitle {
+    color: #ffffff !important;
+}
+
+.heroSubTitle {
+    color: #ffffff !important;
+}
+
+/* KPI Tiles */
+.kpiBlue {
+    border-top: 4px solid #0A6ED1;
+}
+
+.kpiGreen {
+    border-top: 4px solid #188038;
+}
+
+.kpiOrange {
+    border-top: 4px solid #E37400;
+}
+
+.kpiRed {
+    border-top: 4px solid #D93025;
+}
+
+.kpiPurple {
+    border-top: 4px solid #7E57C2;
+}
+
+/* Tile Styling */
+.sapMGT {
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+/* Panel Headers */
+.sapMPanelHdr {
+    font-weight: 700 !important;
+    color: #143D6B !important;
+}
+
+/* Interactive Bar Charts – professional teal */
+.sapSuiteIBCBarInner,
+.sapSuiteIBCBar .sapSuiteIBCBarInner,
+.sapSuiteIBCBarValue {
+    background-color: #0F766E !important;
+    fill: #0F766E !important;
+}
+
+.sapSuiteIBCBar:hover .sapSuiteIBCBarInner,
+.sapSuiteIBCBar:hover .sapSuiteIBCBarValue {
+    background-color: #134E4A !important;
+    fill: #134E4A !important;
+}
+
+/* Panel header colour (was navy blue) */
+.sapMPanelHdr {
+    font-weight: 700 !important;
+    color: #1F2937 !important;
+}
+.empTile .sapMGTContent {
+    background: linear-gradient(to bottom,#e8f2ff,#ffffff);
+}
+.empTile {
+    border-top: 4px solid #0A6ED1;
+}
+
+.deptTile {
+    border-top: 4px solid #188038;
+}
+
+.catTile {
+    border-top: 4px solid #2c93d6 ;
+}
+
+.vendorTile {
+    border-top: 4px solid #E37400;
+}
+
+.maintTile {
+    border-top: 4px solid #D93025;
+}
+
+.warrantyTile {
+    border-top: 4px solid #7E57C2;
+}
+.adminHero {
+    background: linear-gradient(90deg, #134E4A 0%, #0F766E 55%, #475569 100%);
+    border-radius: 16px;
+    padding: 2rem;
+    margin-bottom: 1rem;
+    color: #ffffff;
+}
