@@ -1,9 +1,9 @@
 {
   "name": "it_asset",
   "version": "1.0.0",
-  "description": "Welcome to your new CAP project.",
+  "description": "Welcome to your CAP project.",
   "license": "ISC",
-  "author": "",
+  "author": "Srinidhi",
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
